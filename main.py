@@ -1,95 +1,157 @@
 import base64
+import binascii
 import io
 import re
+from threading import Lock
+
 import cv2
-import uvicorn
+import ddddocr
 import numpy as np
-from PIL import Image
-from fastapi import FastAPI
+import uvicorn
+from fastapi import FastAPI, HTTPException, status
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
-from paddleocr import PaddleOCR
-# from matplotlib import pyplot as plt
 
-app = FastAPI()
-# Paddleocr目前支持中英文、英文、法语、德语、韩语、日语，可以通过修改lang参数进行切换
-# 参数依次为`ch`, `en`, `french`, `german`, `korean`, `japan`。
-ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_SIDE = 4096
+DARK_PIXEL_THRESHOLD = 64
+MIN_COMPONENT_AREA = 3
+BORDER_WIDTH = 2
+
+app = FastAPI(title="MoviePilot OCR", version="2.0.0")
+
+# The beta model is materially more accurate on MoviePilot's captcha samples.
+ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
+ocr_lock = Lock()
 
 
-class OCR(BaseModel):
+class OCRRequest(BaseModel):
     base64_img: str
 
 
+class OCRResponse(BaseModel):
+    result: str
+
+
+class ImageTooLargeError(ValueError):
+    pass
+
+
+class InvalidImageError(ValueError):
+    pass
+
+
 @app.get("/")
-async def root():
+def root():
     return {"message": "MoviePilot OCR API"}
 
 
-@app.post("/captcha/base64")
-async def captcha_base64(data: OCR):
-    base64_img = data.dict().get("base64_img")
-    img_b = base64.b64decode(base64_img.encode('utf-8'))
-    img = Image.open(io.BytesIO(img_b)).convert("RGB")
-    mask_npl = np.array(img, dtype=np.uint8)
-
-    ret, thresh = cv2.threshold(mask_npl, 1, 255, cv2.THRESH_BINARY)
-
-    thresh1 = noise_unsome_piexl(thresh)
-
-    gray_image = around_white(thresh1)
-
-    results = ocr.ocr(gray_image, cls=True)
+@app.post("/captcha/base64", response_model=OCRResponse)
+def captcha_base64(data: OCRRequest):
     try:
-        result = ''.join(re.findall(r'[A-Za-z0-9]', results[0][0][1][0]))
-    except Exception as e:
-        print(str(e))
-        result = ''
-    return {"result": result}
+        image_bytes = decode_base64_image(data.base64_img)
+        result = recognize_captcha(image_bytes)
+    except ImageTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+    except InvalidImageError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return OCRResponse(result=result)
 
 
-# 四周置白色
-def around_white(img):
-    w, h, s = img.shape
-    for _w in range(w):
-        for _h in range(h):
-            if (_w <= 5) or (_h <= 5) or (_w >= w-5) or (_h >= h-5):
-                img.itemset((_w, _h, 0), 255)
-                img.itemset((_w, _h, 1), 255)
-                img.itemset((_w, _h, 2), 255)
-    return img
+def decode_base64_image(value: str) -> bytes:
+    payload = "".join((value or "").split())
+    if payload.lower().startswith("data:image/"):
+        metadata, separator, payload = payload.partition(",")
+        if not separator or ";base64" not in metadata.lower():
+            raise InvalidImageError("invalid image data URL")
+
+    if not payload:
+        raise InvalidImageError("base64_img must not be empty")
+
+    max_encoded_length = ((MAX_IMAGE_BYTES + 2) // 3) * 4
+    if len(payload) > max_encoded_length:
+        raise ImageTooLargeError("image exceeds the 5 MiB limit")
+
+    padding = len(payload) % 4
+    if padding:
+        payload += "=" * (4 - padding)
+
+    try:
+        image_bytes = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidImageError("base64_img is not valid Base64") from exc
+
+    if not image_bytes:
+        raise InvalidImageError("decoded image must not be empty")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ImageTooLargeError("image exceeds the 5 MiB limit")
+    return image_bytes
 
 
-# 邻域非同色降噪
-def noise_unsome_piexl(img):
-    '''
-        查找像素点上下左右相邻点的颜色，如果是非白色的非像素点颜色，则填充为白色
-    '''
-    # print(img.shape)
-    w, h, s = img.shape
-    for _w in range(w):
-        for _h in range(h):
-            if _h != 0 and _w != 0 and _w < w - 1 and _h < h - 1:# 剔除顶点、底点
-                center_color = img[_w, _h] # 当前坐标颜色
-                # print(center_color)
-                top_color = img[_w, _h + 1]
-                bottom_color = img[_w, _h - 1]
-                left_color = img[_w - 1, _h]
-                right_color = img[_w + 1, _h]
-                cnt = 0
-                if top_color.all() == center_color.all():
-                    cnt += 1
-                if bottom_color.all() == center_color.all():
-                    cnt += 1
-                if left_color.all() == center_color.all():
-                    cnt += 1
-                if right_color.all() == center_color.all():
-                    cnt += 1
-                if cnt < 1:
-                    img.itemset((_w, _h, 0), 255)
-                    img.itemset((_w, _h, 1), 255)
-                    img.itemset((_w, _h, 2), 255)
-    return img
+def preprocess_captcha(image_bytes: bytes) -> bytes:
+    gray = load_grayscale_image(image_bytes)
+    binary = np.where(gray <= DARK_PIXEL_THRESHOLD, 0, 255).astype(np.uint8)
+
+    foreground = (binary == 0).astype(np.uint8)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8,
+    )
+    keep_labels = stats[:, cv2.CC_STAT_AREA] >= MIN_COMPONENT_AREA
+    keep_labels[0] = False
+    cleaned = np.where(keep_labels[labels], 0, 255).astype(np.uint8)
+
+    border = min(BORDER_WIDTH, cleaned.shape[0] // 2, cleaned.shape[1] // 2)
+    if border:
+        cleaned[:border, :] = 255
+        cleaned[-border:, :] = 255
+        cleaned[:, :border] = 255
+        cleaned[:, -border:] = 255
+
+    encoded, output = cv2.imencode(".png", cleaned)
+    if not encoded:
+        raise InvalidImageError("failed to preprocess image")
+    return output.tobytes()
 
 
-if __name__ == '__main__':
-    uvicorn.run('main:app', host="0.0.0.0", port=9899, reload=False)
+def load_grayscale_image(image_bytes: bytes) -> np.ndarray:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise InvalidImageError("image dimensions must be positive")
+            if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
+                raise ImageTooLargeError("image dimensions exceed 4096 x 4096 pixels")
+
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, "white")
+                image = Image.alpha_composite(background, rgba).convert("RGB")
+            return np.asarray(image.convert("L"), dtype=np.uint8)
+    except ImageTooLargeError:
+        raise
+    except InvalidImageError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise InvalidImageError("decoded content is not a supported image") from exc
+
+
+def recognize_captcha(image_bytes: bytes) -> str:
+    processed = preprocess_captcha(image_bytes)
+    with ocr_lock:
+        prediction = ocr.classification(processed)
+
+    # These captchas use uppercase ASCII letters and digits. Normalizing the
+    # model output also resolves visually identical upper/lowercase glyphs.
+    return "".join(re.findall(r"[A-Za-z0-9]", prediction)).upper()
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=9899, reload=False)

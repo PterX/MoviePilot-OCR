@@ -1,31 +1,28 @@
-FROM python:3.10.11-slim-bullseye
-ENV LANG="C.UTF-8" \
-    TZ="Asia/Shanghai" \
-    REPO_URL="https://github.com/jxxghp/MoviePilot-OCR.git" \
-    WORKDIR="/app"
-RUN apt-get update -y \
-    && apt-get install -y \
-        git \
-        ffmpeg \
-        libgomp1 \
-        libsm6 \
-        libxrender1 \
-        libxext6 \
-        libgl1 \
-        libssl1.1 \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf \
-        /tmp/* \
-        /var/lib/apt/lists/* \
-        /var/tmp/*
-RUN git clone -b main ${REPO_URL} ${WORKDIR}
-WORKDIR ${WORKDIR}
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt \
-    && rm -rf \
-        /tmp/* \
-        /root/.cache \
-        /var/tmp/*
+FROM python:3.12-slim-bookworm
+
+ENV LANG=C.UTF-8 \
+    TZ=Asia/Shanghai \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY main.py ./
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 EXPOSE 9899
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9899/', timeout=3)"
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9899"]

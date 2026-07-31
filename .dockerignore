@@ -1,0 +1,9 @@
+.DS_Store
+.git
+.github
+.idea
+__pycache__
+*.py[cod]
+test.py
+test_main.http
+venv
